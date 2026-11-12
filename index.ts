@@ -43,7 +43,7 @@ const pendingConnections = new Set<ServerWebSocket<WSData>>();
 const roomName: string = "sala-local";
 const roomCapacity: number = 5;
 const protocolVersion: number = 1;
-const colorFormat: RegExp = /^#[0-9A-F]{6}$/i
+const colorFormat: RegExp = /^[0-9A-F]{6}$/i;
 
 Bun.serve<WSData>({
   port: 7777,
@@ -292,8 +292,8 @@ var validateUserInfo = (ws: ServerWebSocket<WSData>, role: string, displayName: 
     return false;
   }
 
-  if(typeof displayColor !== 'string' || colorFormat.test(displayColor.trim())){
-    rejectJoin(ws, "INVALID_COLOR", "Display color must be a valid color in the hexadecimal format: '#RRGGBB'.");
+  if(typeof displayColor !== 'string' || !colorFormat.test(displayColor.trim())){
+    rejectJoin(ws, "INVALID_COLOR", "Display color must be six hexadecimal RGB characters (RRGGBB), without '#'.");
     return false;
   }
 

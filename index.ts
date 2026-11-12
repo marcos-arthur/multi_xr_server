@@ -10,6 +10,7 @@ type WSData = {
   joined?: boolean,
   role?: string,
   displayName?: string,
+  displayColor?: string,
   sequence?: number,
   closeAfterError?: boolean,
   errorCloseTimer?: ReturnType<typeof setTimeout>;
@@ -42,6 +43,7 @@ const pendingConnections = new Set<ServerWebSocket<WSData>>();
 const roomName: string = "sala-local";
 const roomCapacity: number = 5;
 const protocolVersion: number = 1;
+const colorFormat: RegExp = /^#[0-9A-F]{6}$/i
 
 Bun.serve<WSData>({
   port: 7777,
@@ -87,7 +89,7 @@ Bun.serve<WSData>({
           
           if (!validateRoomInfo(ws, data?.roomId)) return;
 
-          if (!validateUserInfo(ws, data?.role, data?.displayName)) return;
+          if (!validateUserInfo(ws, data?.role, data?.displayName, data?.displayColor)) return;
 
           handleJoin(ws, data);
           return;
@@ -117,6 +119,7 @@ var handleJoin = (ws: ServerWebSocket<WSData>, data: any) => {
     playerId: client.data.playerId!,
     role: client.data.role!,
     displayName: client.data.displayName!,
+    displayColor: client.data.displayColor!
   }));
 
   const playerId = randomUUID();
@@ -124,6 +127,7 @@ var handleJoin = (ws: ServerWebSocket<WSData>, data: any) => {
   ws.data.joined = true;
   ws.data.role = data.role;
   ws.data.displayName = data.displayName.trim();
+  ws.data.displayColor = data.displayColor.trim();
   ws.data.sequence = -1;
 
   pendingConnections.delete(ws);
@@ -146,7 +150,8 @@ var handleJoin = (ws: ServerWebSocket<WSData>, data: any) => {
     type: "player_joined",
     playerId: ws.data.playerId,
     role: ws.data.role,
-    displayName: ws.data.displayName
+    displayName: ws.data.displayName,
+    displayColor: ws.data.displayColor
   };
   
   
@@ -276,7 +281,7 @@ var validateRoomInfo = (ws: ServerWebSocket<WSData>, roomId: string): boolean =>
   return true;
 }
 
-var validateUserInfo = (ws: ServerWebSocket<WSData>, role: string, displayName: string) : boolean => {
+var validateUserInfo = (ws: ServerWebSocket<WSData>, role: string, displayName: string, displayColor: string) : boolean => {
   if (role !== "quest_player" && role !== "desktop_viewer") {
     rejectJoin(ws, "INVALID_ROLE", "Role must be either 'quest_player' or 'desktop_viewer'");
     return false;
@@ -284,6 +289,11 @@ var validateUserInfo = (ws: ServerWebSocket<WSData>, role: string, displayName: 
 
   if(typeof displayName !== 'string' || displayName.trim().length < 1 || displayName.trim().length > 32){
     rejectJoin(ws, "INVALID_NAME", "Display name must have 1 to 32 characters.");
+    return false;
+  }
+
+  if(typeof displayColor !== 'string' || colorFormat.test(displayColor.trim())){
+    rejectJoin(ws, "INVALID_COLOR", "Display color must be a valid color in the hexadecimal format: '#RRGGBB'.");
     return false;
   }
 

@@ -18,6 +18,7 @@ type WSData = {
   appMessagesInWindow?: number,
   appBytesInWindow?: number,
   invalidMessages?: number;
+  reservationToken?: string,
 };
 
 type Vector3 ={
@@ -45,11 +46,14 @@ const clients = new Set<ServerWebSocket<WSData>>();
 const pendingConnections = new Set<ServerWebSocket<WSData>>();
 
 const roomName: string = "sala-local";
-const roomCapacity: number = 5;
+const roomCapacity: number = 10;
+const maxIdentityLobbyConnections = 20;
+const colorReservationMs = 120_000;
 const protocolVersion: number = 1;
 const colorFormat: RegExp = /^[0-9A-F]{6}$/i;
 const pointerColorFormat: RegExp = /^[0-9A-F]{8}$/i;
 const pointerIdFormat: RegExp = /^[0-9A-F]{32}$/i;
+const reservationTokenFormat: RegExp = /^[0-9A-F]{32}$/i;
 const maxAppEnvelopeBytes = 64 * 1024;
 const maxAppMessagesPerSecond = 240;
 const maxAppBytesPerSecond = 2 * 1024 * 1024;
@@ -62,6 +66,15 @@ const pointerStrokeOwners = new Map<string, PointerOwnerRecord>();
 const pointerMeasureOwners = new Map<string, PointerOwnerRecord>();
 let activePointerStrokes = 0;
 let activePointerMeasures = 0;
+
+type ColorReservation = {
+  token: string;
+  color: string;
+  playerId: string;
+  displayName: string;
+  expiresAt: number;
+};
+const colorReservations = new Map<string, ColorReservation>();
 
 Bun.serve<WSData>({
   port: 7777,
@@ -92,7 +105,8 @@ Bun.serve<WSData>({
       if(ws.data.joined){
         clients.delete(ws);
         console.log(`Saiu: ${ws.data.playerId}; participantes existentes: ${clients.size}`);
-        notifyRoomPlayerLeft(ws);
+        if (ws.data.role !== "identity_lobby")
+          notifyRoomPlayerLeft(ws);
       }
     },
 
@@ -114,7 +128,7 @@ Bun.serve<WSData>({
         if(!ws.data.joined){
           if (!validateFirstMessage(ws, data?.type)) return;
           
-          if (!validateRoomInfo(ws, data?.roomId)) return;
+          if (!validateRoomInfo(ws, data?.roomId, data?.role)) return;
 
           if (!validateUserInfo(ws, data?.role, data?.displayName, data?.displayColor)) return;
 
@@ -154,7 +168,27 @@ var handleJoin = (ws: ServerWebSocket<WSData>, data: any) => {
     role: client.data.role!,
     displayName: client.data.displayName!,
     displayColor: client.data.displayColor!
-  }));
+  })).filter(player => player.role !== "identity_lobby");
+
+  const joiningColor = String(data.displayColor).trim().toUpperCase();
+  let reservationToClaim: ColorReservation | undefined;
+  if (data.role === "quest_player") {
+    purgeExpiredColorReservations();
+    const activeOwner = [...clients].find(client => client.data.role === "quest_player" &&
+      client.data.displayColor?.toUpperCase() === joiningColor);
+    const reservation = colorReservations.get(joiningColor);
+    const suppliedToken = typeof data.reservationToken === "string" ? data.reservationToken : "";
+    if (activeOwner) {
+      rejectJoin(ws, "COLOR_IN_USE", "This color is already in use by another player.");
+      return;
+    }
+    if (reservation && reservation.token !== suppliedToken) {
+      rejectJoin(ws, "COLOR_RESERVED", "This color is reserved by another player.");
+      return;
+    }
+    if (reservation && reservation.token === suppliedToken)
+      reservationToClaim = reservation;
+  }
 
   const playerId = randomUUID();
   ws.data.playerId = playerId;
@@ -163,6 +197,7 @@ var handleJoin = (ws: ServerWebSocket<WSData>, data: any) => {
   ws.data.displayName = data.displayName.trim();
   ws.data.displayColor = data.displayColor.trim();
   ws.data.sequence = -1;
+  ws.data.reservationToken = typeof data.reservationToken === "string" ? data.reservationToken : undefined;
 
   pendingConnections.delete(ws);
   
@@ -194,9 +229,15 @@ var handleJoin = (ws: ServerWebSocket<WSData>, data: any) => {
   };
   
   
-  for (const client of clients) {
-    if (client !== ws)
-      sendRoomMessage(client, JSON.stringify(msg_joined));
+  if (ws.data.role !== "identity_lobby") {
+    for (const client of clients) {
+      if (client !== ws)
+        sendRoomMessage(client, JSON.stringify(msg_joined));
+    }
+  }
+  if (reservationToClaim) {
+    colorReservations.delete(reservationToClaim.color);
+    broadcastColorReservations();
   }
   console.log(`Entrou: ${ws.data.playerId}; participantes existentes: ${clients.size}`);
 }
@@ -229,7 +270,8 @@ var handlePose = (ws: ServerWebSocket<WSData>, data: any) => {
 
   const serialized = JSON.stringify(msg);
   clients.forEach(client => {
-    if(client.data.playerId !== ws.data.playerId) sendRoomMessage(client, serialized);
+    if(client.data.playerId !== ws.data.playerId && client.data.role !== "identity_lobby")
+      sendRoomMessage(client, serialized);
   })
 }
 
@@ -240,8 +282,8 @@ var handleAppMessage = (ws: ServerWebSocket<WSData>, data: any, rawMessage: stri
     return;
   }
 
-  if (data.channel !== "pointer") {
-    rejectClientMessage(ws, "UNKNOWN_APP_CHANNEL", "Only the 'pointer' application channel is enabled.");
+  if (data.channel !== "pointer" && data.channel !== "identity") {
+    rejectClientMessage(ws, "UNKNOWN_APP_CHANNEL", "Only the 'pointer' and 'identity' application channels are enabled.");
     return;
   }
 
@@ -274,6 +316,28 @@ var handleAppMessage = (ws: ServerWebSocket<WSData>, data: any, rawMessage: stri
       rejectClientMessage(ws, "RECIPIENT_NOT_FOUND", "The app recipient is not in this room.");
       return;
     }
+    if (data.channel === "pointer" && recipient.data.role === "identity_lobby") {
+      rejectClientMessage(ws, "INVALID_RECIPIENT", "Pointer messages cannot target an identity lobby session.");
+      return;
+    }
+  }
+
+  if (data.channel === "identity") {
+    if (ws.data.role !== "identity_lobby") {
+      rejectClientMessage(ws, "IDENTITY_CHANNEL_FORBIDDEN", "Only identity lobby clients may use this channel.");
+      return;
+    }
+    if (recipientId != null) {
+      rejectClientMessage(ws, "INVALID_RECIPIENT", "Identity commands are server-directed and cannot target another participant.");
+      return;
+    }
+    handleIdentityMessage(ws, data.payload);
+    return;
+  }
+
+  if (ws.data.role === "identity_lobby") {
+    rejectClientMessage(ws, "POINTER_CHANNEL_FORBIDDEN", "Identity lobby clients cannot send Pointer messages.");
+    return;
   }
 
   let pointerMessage: any;
@@ -305,10 +369,167 @@ var handleAppMessage = (ws: ServerWebSocket<WSData>, data: any, rawMessage: stri
   }
 
   for (const client of clients) {
-    if (client !== ws)
+    if (client !== ws && client.data.role !== "identity_lobby")
       sendRoomMessage(client, forwarded);
   }
 }
+
+var handleIdentityMessage = (ws: ServerWebSocket<WSData>, payload: string) => {
+  let command: any;
+  try {
+    command = JSON.parse(payload);
+  } catch {
+    rejectClientMessage(ws, "INVALID_IDENTITY_MESSAGE", "Identity payload must contain valid JSON.");
+    return;
+  }
+
+  if (command?.v !== 1 || typeof command.type !== "string") {
+    rejectClientMessage(ws, "INVALID_IDENTITY_MESSAGE", "Identity payload version or type is invalid.");
+    return;
+  }
+
+  const expired = purgeExpiredColorReservations();
+  if (expired)
+    broadcastColorReservations();
+
+  if (command.type === "color_list_request") {
+    const token = typeof command.token === "string" ? command.token.trim().toLowerCase() : "";
+    ws.data.reservationToken = reservationTokenFormat.test(token) ? token : undefined;
+    sendIdentityMessage(ws, {
+      v: 1,
+      type: "color_reservations",
+      reservations: colorReservationsForClient(ws),
+    });
+    return;
+  }
+
+  if (command.type === "color_reserve") {
+    const color = typeof command.color === "string" ? command.color.trim().toUpperCase() : "";
+    const token = typeof command.token === "string" ? command.token.trim().toLowerCase() : "";
+    const displayName = typeof command.displayName === "string" ? command.displayName.trim().slice(0, 32) : "";
+    if (!colorFormat.test(color) || !reservationTokenFormat.test(token) || displayName.length === 0) {
+      sendIdentityMessage(ws, {
+        v: 1, type: "color_reservation_result", accepted: false, color, token,
+        code: "INVALID_RESERVATION", message: "Color, token or display name is invalid.",
+      });
+      return;
+    }
+
+    const activeOwner = [...clients].find(client => client.data.role === "quest_player" &&
+      client.data.displayColor?.toUpperCase() === color);
+    const existing = colorReservations.get(color);
+    if (activeOwner || (existing != null && existing.token !== token)) {
+      sendIdentityMessage(ws, {
+        v: 1, type: "color_reservation_result", accepted: false, color, token,
+        code: activeOwner ? "COLOR_IN_USE" : "COLOR_RESERVED",
+        ownerName: activeOwner?.data.displayName ?? existing?.displayName ?? "",
+        message: activeOwner ? "This color is already in use." : "This color is reserved by another player.",
+      });
+      return;
+    }
+
+    // O mesmo token pode mover sua reserva para outra cor depois que a nova cor foi validada.
+    for (const [reservedColor, reservation] of colorReservations) {
+      if (reservation.token === token && reservedColor !== color)
+        colorReservations.delete(reservedColor);
+    }
+
+    colorReservations.set(color, {
+      token,
+      color,
+      playerId: ws.data.playerId!,
+      displayName,
+      expiresAt: Date.now() + colorReservationMs,
+    });
+    ws.data.reservationToken = token;
+    sendIdentityMessage(ws, {
+      v: 1, type: "color_reservation_result", accepted: true, color, token,
+      expiresInMs: colorReservationMs,
+    });
+    broadcastColorReservations();
+    return;
+  }
+
+  if (command.type === "color_release") {
+    const token = typeof command.token === "string" ? command.token.trim().toLowerCase() : "";
+    if (!reservationTokenFormat.test(token)) {
+      rejectClientMessage(ws, "INVALID_RESERVATION", "Reservation token is invalid.");
+      return;
+    }
+
+    let changed = false;
+    for (const [color, reservation] of colorReservations) {
+      if (reservation.token === token &&
+          (reservation.playerId === ws.data.playerId || ws.data.reservationToken === token)) {
+        colorReservations.delete(color);
+        changed = true;
+      }
+    }
+    sendIdentityMessage(ws, { v: 1, type: "color_release_result", token, released: changed });
+    if (changed)
+      broadcastColorReservations();
+    return;
+  }
+
+  rejectClientMessage(ws, "UNKNOWN_IDENTITY_COMMAND", "Identity command is not supported.");
+}
+
+var sendIdentityMessage = (ws: ServerWebSocket<WSData>, payload: any) => {
+  if (!ws.data.joined || ws.data.playerId == null)
+    return;
+  sendRoomMessage(ws, JSON.stringify({
+    protocolVersion,
+    type: "app",
+    playerId: "server",
+    channel: "identity",
+    payload: JSON.stringify(payload),
+  }));
+}
+
+var broadcastColorReservations = () => {
+  for (const client of clients) {
+    if (client.data.role !== "identity_lobby") continue;
+    const payload = JSON.stringify({
+      v: 1,
+      type: "color_reservations_updated",
+      reservations: colorReservationsForClient(client),
+    });
+    sendRoomMessage(client, JSON.stringify({
+      protocolVersion,
+      type: "app",
+      playerId: "server",
+      channel: "identity",
+      payload,
+    }));
+  }
+}
+
+var colorReservationsForClient = (ws: ServerWebSocket<WSData>) => {
+  purgeExpiredColorReservations();
+  return [...colorReservations.values()].map(reservation => ({
+    color: reservation.color,
+    displayName: reservation.displayName,
+    expiresAt: reservation.expiresAt,
+    ...(reservation.token === ws.data.reservationToken ? { token: reservation.token } : {}),
+  }));
+}
+
+var purgeExpiredColorReservations = (): boolean => {
+  const now = Date.now();
+  let changed = false;
+  for (const [color, reservation] of colorReservations) {
+    if (reservation.expiresAt <= now) {
+      colorReservations.delete(color);
+      changed = true;
+    }
+  }
+  return changed;
+}
+
+setInterval(() => {
+  if (purgeExpiredColorReservations())
+    broadcastColorReservations();
+}, 5_000);
 
 var consumeAppBudget = (ws: ServerWebSocket<WSData>, bytes: number): boolean => {
   const now = Date.now();
@@ -606,13 +827,20 @@ var validateFirstMessage = (ws: ServerWebSocket<WSData>, type: string) : boolean
   return true;
 }
 
-var validateRoomInfo = (ws: ServerWebSocket<WSData>, roomId: string): boolean => {
+var validateRoomInfo = (ws: ServerWebSocket<WSData>, roomId: string, role: string): boolean => {
   if(roomId !== roomName){
     rejectJoin(ws, "ROOM_NOT_FOUND", `The room ${roomId} does not exist.`);
     return false;
   }
   
-  if(clients.size >= roomCapacity){
+  const identityLobbyCount = [...clients].filter(client => client.data.role === "identity_lobby").length;
+  const countedRoomUsers = [...clients].filter(client => client.data.role !== "identity_lobby").length;
+  if (role === "identity_lobby" && identityLobbyCount >= maxIdentityLobbyConnections) {
+    rejectJoin(ws, "IDENTITY_LOBBY_FULL", "Too many identity lobby sessions are connected.");
+    return false;
+  }
+
+  if(role !== "identity_lobby" && countedRoomUsers >= roomCapacity){
     rejectJoin(ws, "ROOM_FULL", `The room reached its capacity of ${roomCapacity} connected users`);
     return false;
   }
@@ -621,8 +849,8 @@ var validateRoomInfo = (ws: ServerWebSocket<WSData>, roomId: string): boolean =>
 }
 
 var validateUserInfo = (ws: ServerWebSocket<WSData>, role: string, displayName: string, displayColor: string) : boolean => {
-  if (role !== "quest_player" && role !== "desktop_viewer") {
-    rejectJoin(ws, "INVALID_ROLE", "Role must be either 'quest_player' or 'desktop_viewer'");
+  if (role !== "quest_player" && role !== "desktop_viewer" && role !== "identity_lobby") {
+    rejectJoin(ws, "INVALID_ROLE", "Role must be 'quest_player', 'desktop_viewer' or 'identity_lobby'.");
     return false;
   }
 
@@ -726,7 +954,7 @@ setInterval(() => {
     service: "djembefola",                  // "assinatura" pro Unity filtrar
     name: "Sala do Djembe",                 // nome que aparece na lista
     wsPort: 7777,                           // porta do seu WebSocket
-    players: clients.size,                  // reaproveita seu Set de clientes
+    players: [...clients].filter(client => client.data.role !== "identity_lobby").length,
   });
   const buf = Buffer.from(payload);
   // broadcast pra todo mundo na rede local, na porta de descoberta
